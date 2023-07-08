@@ -1,17 +1,18 @@
 package clinic.models;
 
-import lombok.Getter;
-import lombok.Setter;
+import lombok.*;
 
 import javax.persistence.*;
 import java.time.LocalDateTime;
-import java.util.List;
 
 @Entity
 @Table(name = "SCHEDULE")
 @Getter
 @Setter
-public class Schedule {
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class Schedule implements IEntity{
     @Id
     @Column(name = "SCHEDULE_ID")
     @GeneratedValue(strategy= GenerationType.AUTO)
@@ -26,7 +27,4 @@ public class Schedule {
     @ManyToOne
     @JoinColumn(name = "DOCTOR_ID", referencedColumnName = "DOCTOR_ID")
     private Doctor doctor;
-
-    @OneToMany(mappedBy = "schedule")
-    private List<ScheduleDetail> scheduleDetails;
 }

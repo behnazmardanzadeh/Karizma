@@ -1,23 +1,18 @@
 package clinic.services;
 
-import clinic.common.Consts;
+import clinic.common.Constants;
 import clinic.models.*;
+import clinic.models.dto.ScheduleDetailAppointmentDto;
 import clinic.models.dto.SetAppointmentDto;
-import clinic.services.repositories.AppointmentRepository;
-import clinic.services.repositories.DoctorRepository;
-import clinic.services.repositories.PatientRepository;
-import clinic.services.repositories.ScheduleRepository;
+import clinic.config.eventhandler.AfterSaveEvent;
+import clinic.services.repositories.*;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEventPublisher;
 
 import java.time.DayOfWeek;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
-import java.time.temporal.ChronoUnit;
-import java.util.Comparator;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.*;
 import java.util.stream.Collectors;
 
 public class AppointmentService {
@@ -30,15 +25,21 @@ public class AppointmentService {
     private PatientRepository patientRepository;
     @Autowired
     private ScheduleRepository scheduleRepository;
+    @Autowired
+    private ScheduleDetailRepository scheduleDetailRepository;
+    @Autowired
+    private ApplicationEventPublisher applicationEventPublisher;
 
     public AppointmentService(AppointmentRepository appointmentRepository,
                               DoctorRepository doctorRepository,
                               PatientRepository patientRepository,
-                              ScheduleRepository scheduleRepository) {
+                              ScheduleRepository scheduleRepository,
+                              ScheduleDetailRepository scheduleDetailRepository) {
         this.appointmentRepository = appointmentRepository;
         this.doctorRepository = doctorRepository;
         this.patientRepository = patientRepository;
         this.scheduleRepository = scheduleRepository;
+        this.scheduleDetailRepository = scheduleDetailRepository;
     }
 
     public Appointment saveAppointment(SetAppointmentDto setAppointmentDto) {
@@ -49,21 +50,47 @@ public class AppointmentService {
         validateDurationInMinutes(durationMinutes, doctor);
         LocalDateTime startDateTime = setAppointmentDto.getStartDateTime();
         validateStartDateTime(startDateTime);
-        checkDoctorPresenceInClinic(startDateTime, doctor);
-        List<Appointment> patientAppointments = checkPatientAppointmentsCount(startDateTime.toLocalDate(), patient);
+        ScheduleDetail scheduleDetail = getScheduleDetailByDoctor(doctor, startDateTime);
+        List<Appointment> patientAppointments = checkPatientAppointmentsCount(startDateTime, patient);
         if (patientAppointments != null && !patientAppointments.isEmpty()) {
-            checkPatientAppointmentsOverlap(startDateTime.toLocalTime(), patientAppointments, patient.getPatientId());
+            checkPatientAppointmentsOverlap(startDateTime, durationMinutes, patientAppointments, patient.getPatientId());
         }
-        LocalDateTime correctedStartDateTime = checkDoctorAppointmentsOverlap(doctor, startDateTime, durationMinutes);
+        checkStartDateTimeInScheduleDetailRange(startDateTime, durationMinutes, scheduleDetail);
+        checkDoctorAppointmentsOverlap(doctor, startDateTime, durationMinutes, scheduleDetail);
 
         Appointment savedAppointment = appointmentRepository.save(
                 Appointment.builder()
                         .doctor(doctor)
                         .patient(patient)
                         .durationMinutes(durationMinutes)
-                        .startDateTime(correctedStartDateTime)
+                        .startDateTime(startDateTime)
+                        .scheduleDetail(scheduleDetail)
                         .build());
+        applicationEventPublisher.publishEvent(new AfterSaveEvent(savedAppointment));
         return savedAppointment;
+    }
+
+    private void checkStartDateTimeInScheduleDetailRange(LocalDateTime startDateTime,
+                                                         Integer durationMinutes,
+                                                         ScheduleDetail scheduleDetail) {
+        LocalDateTime endDateTime = startDateTime.plusMinutes(durationMinutes);
+        LocalDateTime scheduleDateTimeStart = scheduleDetail.getScheduleDateTimeStart();
+        LocalDateTime scheduleDateTimeEnd = scheduleDetail.getScheduleDateTimeEnd();
+        boolean isInRange = ((startDateTime.isAfter(scheduleDateTimeStart) || startDateTime.isEqual(scheduleDateTimeStart))
+                && (startDateTime.isBefore(scheduleDateTimeEnd) || startDateTime.isEqual(scheduleDateTimeEnd)))
+                &&
+                ((endDateTime.isAfter(scheduleDateTimeStart) || endDateTime.isEqual(scheduleDateTimeStart))
+                        && (endDateTime.isBefore(scheduleDateTimeEnd) || endDateTime.isEqual(scheduleDateTimeEnd)));
+        if (!isInRange) {
+            String errorMessage = "Doctor is not present on provided startDateTime: %s." +
+                    " Based on startDateTime, doctor is present from %s to %s";
+            throw new RuntimeException(
+                    String.format(
+                            errorMessage,
+                            startDateTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME),
+                            scheduleDateTimeStart.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME),
+                            scheduleDateTimeEnd.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)));
+        }
     }
 
     public Appointment saveEarliestAppointment(SetAppointmentDto setAppointmentDto) {
@@ -72,17 +99,30 @@ public class AppointmentService {
         Integer durationMinutes = setAppointmentDto.getDurationMinutes();
         validateDurationInMinutes(durationMinutes, doctor);
         LocalDateTime startDateTime = getEarliest(doctor, durationMinutes);
-        List<Appointment> patientAppointments = checkPatientAppointmentsCount(startDateTime.toLocalDate(), patient);
-        if (patientAppointments != null && !patientAppointments.isEmpty()) {
-            checkPatientAppointmentsOverlap(startDateTime.toLocalTime(), patientAppointments, patient.getPatientId());
+        if (startDateTime == null) {
+            String errorMsg = "Doctor schedule is full.%s";
+            int minDuration = doctor.getDoctorType().getDoctorTypeDurationMin();
+            String msg = "";
+            if (durationMinutes > minDuration) {
+                msg = " You may try smaller durationMinutes. minimum: %d";
+                msg = String.format(msg, minDuration);
+            }
+            throw new RuntimeException(String.format(errorMsg, msg));
         }
+        List<Appointment> patientAppointments = checkPatientAppointmentsCount(startDateTime, patient);
+        if (patientAppointments != null && !patientAppointments.isEmpty()) {
+            checkPatientAppointmentsOverlap(startDateTime, durationMinutes, patientAppointments, patient.getPatientId());
+        }
+        ScheduleDetail scheduleDetail = getScheduleDetailByDoctor(doctor, startDateTime);
         Appointment savedAppointment = appointmentRepository.save(
                 Appointment.builder()
                         .doctor(doctor)
                         .patient(patient)
                         .durationMinutes(durationMinutes)
                         .startDateTime(startDateTime)
+                        .scheduleDetail(scheduleDetail)
                         .build());
+        applicationEventPublisher.publishEvent(new AfterSaveEvent(savedAppointment));
         return savedAppointment;
     }
 
@@ -106,103 +146,182 @@ public class AppointmentService {
                     + doctor.getDoctorId() + " and date greater than or equal today.");
         }
         Schedule schedule = doctorSchedules.get(0);
-        List<ScheduleDetail> details =
-                schedule.getScheduleDetails().stream()
-                        .sorted(Comparator.comparing(ScheduleDetail::getScheduleDateTimeStart))
-                        .collect(Collectors.toList());
 
-        if (details == null || details.isEmpty()) {
+        List<ScheduleDetailAppointmentDto> scheduleDetailAppointmentDtoList =
+                scheduleDetailRepository.findAppointmentByScheduleId(schedule.getScheduleId())
+                        .orElseThrow(() -> new IllegalArgumentException("No ScheduleDetail found by doctorId : "
+                                + doctor.getDoctorId() + " and date greater than or equal today."));
+
+        if (scheduleDetailAppointmentDtoList.isEmpty()) {
             throw new IllegalArgumentException("No ScheduleDetail found by doctorId : "
                     + doctor.getDoctorId() + " and date greater than or equal today.");
         }
 
-        LocalDateTime appointmentDateTime = details.get(0).getScheduleDateTimeStart();
+        Map<Long, List<Appointment>> scheduleDetailAppointmentsMap = new HashMap<>();
+        List<ScheduleDetail> scheduleDetails = new ArrayList<>();
+        List<Appointment> allAppointments = new ArrayList<>();
+        scheduleDetailAppointmentDtoList.stream().forEach(scheduleDetailAppointmentDto -> {
+            ScheduleDetail scheduleDetail = scheduleDetailAppointmentDto.getScheduleDetail();
+            Appointment appointment = scheduleDetailAppointmentDto.getAppointment();
+            allAppointments.add(appointment);
+            scheduleDetails.add(scheduleDetail);
+            Long scheduleDetailId = scheduleDetail.getScheduleDetailId();
+            List<Appointment> appointments = scheduleDetailAppointmentsMap.get(scheduleDetailId);
+            if (appointments == null || appointments.isEmpty()) {
+                appointments = new ArrayList<>();
+            } else {
+                scheduleDetailAppointmentsMap.remove(scheduleDetailId);
+            }
+            appointments.add(appointment);
+            appointments.sort(Comparator.comparing(Appointment::getStartDateTime));
+            scheduleDetailAppointmentsMap.put(scheduleDetailId, appointments);
+        });
+        scheduleDetails.sort(Comparator.comparing(ScheduleDetail::getScheduleDateTimeStart));
 
-        List<Appointment> doctorAppointments = doctor.getDoctorAppointments();
-        if (doctorAppointments != null && !doctorAppointments.isEmpty()) {
-            boolean notFound = true;
-            for (int dIndex = 0; dIndex < details.size() && notFound; dIndex++) {
-                ScheduleDetail detail = details.get(dIndex);
+        Map<LocalDateTime, List<Long>> startAppointmentIdListMap = new HashMap<>();
+        Map<LocalDateTime, List<Long>> endAppointmentIdListMap = new HashMap<>();
+        if (!allAppointments.isEmpty()) {
+            allAppointments.stream()
+                    .filter(Objects::nonNull)
+                    .filter(appointment -> appointment.getAppointmentId() != null)
+                    .forEach(appointment -> {
+                        Long appointmentId = appointment.getAppointmentId();
+
+                        LocalDateTime startDateTime = appointment.getStartDateTime();
+                        updateMap(startAppointmentIdListMap, appointmentId, startDateTime);
+
+                        Integer appointmentDurationMinutes = appointment.getDurationMinutes();
+                        LocalDateTime startDateTimeEnd = startDateTime.plusMinutes(appointmentDurationMinutes);
+                        updateMap(endAppointmentIdListMap, appointmentId, startDateTimeEnd);
+                    });
+        }
+
+        Integer doctorTypeOverlappingAppointments = doctor.getDoctorType().getDoctorTypeOverlappingAppointments();
+        int numberOfAllowedOverlap = doctorTypeOverlappingAppointments > 0 ? doctorTypeOverlappingAppointments : 0;
+        Map<Long, Set<Long>> detailIdOverlappingAppointmentsMap = new HashMap<>();
+        scheduleDetailAppointmentsMap.keySet().stream()
+                .forEach(scheduleDetailId -> {
+                    Set<Long> overlappingAppointments =
+                            checkOverlappingAppointments(
+                                    scheduleDetailAppointmentsMap.get(scheduleDetailId),
+                                    numberOfAllowedOverlap);
+                    detailIdOverlappingAppointmentsMap.put(scheduleDetailId, overlappingAppointments);
+                });
+
+        LocalDateTime appointmentDateTime = null;
+        for (Iterator<ScheduleDetail> iterator = scheduleDetails.iterator();
+             appointmentDateTime == null && iterator.hasNext(); ) {
+            ScheduleDetail detail = iterator.next();
+            Long scheduleDetailId = detail.getScheduleDetailId();
+            List<Appointment> appointments = scheduleDetailAppointmentsMap.get(scheduleDetailId);
+            if (appointments == null || appointments.isEmpty()) {
                 appointmentDateTime = detail.getScheduleDateTimeStart();
-                List<Appointment> appointments = doctorAppointments.stream().filter(appointment -> {
-                            LocalDateTime appointmentStartDateTime = appointment.getStartDateTime();
-                            LocalDateTime detailStart = detail.getScheduleDateTimeStart();
-                            return appointmentStartDateTime.isAfter(detailStart)
-                                    || appointmentStartDateTime.isEqual(detailStart);
-                        }).filter(appointment -> {
-                            LocalDateTime appointmentStartDateTime = appointment.getStartDateTime();
-                            LocalDateTime detailEnd = detail.getScheduleDateTimeEnd();
-                            return appointmentStartDateTime.isBefore(detailEnd)
-                                    || appointmentStartDateTime.isEqual(detailEnd);
-                        }).sorted(Comparator.comparing(Appointment::getStartDateTime))
-                        .collect(Collectors.toList());
-                if (appointments == null || appointments.isEmpty()) {
-                    notFound = false;
-                }
-                int overlapCounter = 0;
-                /**
-                 * How come doctor.getDoctorType().getDoctorTypeOverlappingAppointments() - 1 ?
-                 * 1 overlap includes 2 appointments
-                 */
-                Integer doctorTypeOverlappingAppointments = doctor.getDoctorType().getDoctorTypeOverlappingAppointments();
-                boolean isOverlapAllowed = doctorTypeOverlappingAppointments > 0;
-                int numberOfAllowedOverlap = doctorTypeOverlappingAppointments > 0 ? doctorTypeOverlappingAppointments - 1 : 0;
-                LocalDateTime previousAppointmentEnd = null;
-                for (int i = 0; i < appointments.size() && notFound; i++) {
-                    Appointment appointment = appointments.get(i);
-                    LocalDateTime appointmentStart = appointment.getStartDateTime();
-                    LocalDateTime appointmentEnd = appointmentStart.plusMinutes(appointment.getDurationMinutes());
-                    if (isOverlapAllowed && isOverlappingAppointment(previousAppointmentEnd, appointmentStart)) {
-                        overlapCounter++;
-                        if (overlapCounter >= numberOfAllowedOverlap) {
-                            isOverlapAllowed = false;
-                        }
-                    }
-                    if (previousAppointmentEnd != null) {
-                        /**
-                         * as mentioned before in "getAppointmentsInScheduleDetailRange" method,
-                         * plusMinutes(1) is added to appointmentEnd
-                         * in order to avoid overlapping.
-                         */
-                        LocalDateTime earliestAppointmentStart = previousAppointmentEnd.plusMinutes(1);
-                        if (earliestAppointmentStart.plusMinutes(durationMinutes).isBefore(appointmentStart)) {
-                            appointmentDateTime = earliestAppointmentStart;
-                            notFound = false;
-                        }
-                    }
-                    previousAppointmentEnd = appointmentEnd;
-                }
-                if (notFound && isOverlapAllowed) {
-                    int windowSize = numberOfAllowedOverlap;
-                    int earliestAppointmentDuration = durationMinutes;
-                    int startIndex = 0;
-                    int currentIndex = 0;
-                    while(currentIndex < appointments.size()) {
-                        for (int i = currentIndex; i < (startIndex + windowSize) && notFound; i++) {
-                            currentIndex = i;
-                            Appointment appointment = appointments.get(i);
-                            Integer appointmentDurationMinutes = appointment.getDurationMinutes();
-                            if (appointmentDurationMinutes >= earliestAppointmentDuration) {
-                                notFound = false;
-                                currentIndex = appointments.size();
-                            } else {
-                                earliestAppointmentDuration -= appointmentDurationMinutes;
-                                if (earliestAppointmentDuration <= 0) {
-                                    notFound = false;
-                                    currentIndex = appointments.size();
-                                }
-                            }
-                        }
-                        if (notFound) {
-                            startIndex = currentIndex;
-                            earliestAppointmentDuration = durationMinutes;
-                        }
-                    }
-                    appointmentDateTime = appointments.get(startIndex).getStartDateTime();
-                }
+            }
+            if (appointmentDateTime == null) {
+                appointmentDateTime = getEarliestDateTime(
+                        durationMinutes,
+                        startAppointmentIdListMap,
+                        endAppointmentIdListMap,
+                        numberOfAllowedOverlap,
+                        detailIdOverlappingAppointmentsMap,
+                        detail,
+                        scheduleDetailId);
             }
         }
         return appointmentDateTime;
+    }
+
+    private static LocalDateTime getEarliestDateTime(Integer durationMinutes,
+                                                     Map<LocalDateTime,
+                                                             List<Long>> startAppointmentIdListMap,
+                                                     Map<LocalDateTime, List<Long>> endAppointmentIdListMap,
+                                                     int numberOfAllowedOverlap,
+                                                     Map<Long, Set<Long>> detailIdOverlappingAppointmentsMap,
+                                                     ScheduleDetail detail,
+                                                     Long scheduleDetailId) {
+        LocalDateTime appointmentDateTime = null;
+        LocalDateTime detailStart = detail.getScheduleDateTimeStart();
+        Set<Long> visitedAppointments = new HashSet<>();
+        for (LocalDateTime start = detailStart;
+             (start.isBefore(detailStart.plusMinutes(durationMinutes)) || start.isEqual(detailStart.plusMinutes(durationMinutes)));
+             start = start.plusMinutes(1)) {
+            List<Long> matchedAppointments = startAppointmentIdListMap.get(start);
+            if (matchedAppointments != null) {
+                visitedAppointments.addAll(matchedAppointments);
+            }
+        }
+
+        Set<Long> overlappingAppointments = detailIdOverlappingAppointmentsMap.get(scheduleDetailId);
+        boolean isOverlapAllowed = overlappingAppointments.size() != numberOfAllowedOverlap;
+        Set<Long> visitedAndOverlappingAppointments = new HashSet<>();
+        visitedAndOverlappingAppointments.addAll(visitedAppointments);
+        visitedAndOverlappingAppointments.addAll(overlappingAppointments);
+        if ((isOverlapAllowed && visitedAndOverlappingAppointments.size() < numberOfAllowedOverlap) || (visitedAppointments.size() == 0)) {
+            appointmentDateTime = detailStart;
+        }
+
+        for (LocalDateTime start = detailStart.plusMinutes(durationMinutes).plusMinutes(1);
+             (appointmentDateTime == null && (start.isBefore(detail.getScheduleDateTimeEnd()) || start.isEqual(detail.getScheduleDateTimeEnd())));
+             start = start.plusMinutes(1)) {
+            LocalDateTime possibleEarliestStartDateTime = start.minusMinutes(durationMinutes);
+
+            List<Long> removableAppointmentIdList = endAppointmentIdListMap.get(possibleEarliestStartDateTime.minusMinutes(1));
+            if (removableAppointmentIdList != null) {
+                visitedAppointments.removeAll(removableAppointmentIdList);
+                removableAppointmentIdList.removeAll(overlappingAppointments);
+                visitedAndOverlappingAppointments.removeAll(removableAppointmentIdList);
+            }
+
+            List<Long> matchedAppointments = startAppointmentIdListMap.get(start);
+            if (matchedAppointments != null) {
+                visitedAppointments.addAll(matchedAppointments);
+                visitedAndOverlappingAppointments.addAll(matchedAppointments);
+            }
+
+            if (visitedAppointments.size() == 0) {
+                appointmentDateTime = possibleEarliestStartDateTime;
+            } else if (isOverlapAllowed
+                    && visitedAndOverlappingAppointments.size() < numberOfAllowedOverlap
+            ) {
+                appointmentDateTime = possibleEarliestStartDateTime;
+            }
+        }
+        return appointmentDateTime;
+    }
+
+    private static void updateMap(Map<LocalDateTime, List<Long>> startEndAppointmentsMap, Long appointmentId, LocalDateTime startDateTime) {
+        List<Long> appointmentIdList = startEndAppointmentsMap.get(startDateTime);
+        if (appointmentIdList == null) {
+            appointmentIdList = new ArrayList<>();
+        } else {
+            startEndAppointmentsMap.remove(startDateTime);
+        }
+        appointmentIdList.add(appointmentId);
+        startEndAppointmentsMap.put(startDateTime, appointmentIdList);
+    }
+
+    private static Set<Long> checkOverlappingAppointments(List<Appointment> appointments,
+                                                          int numberOfAllowedOverlap) {
+        Appointment previousAppointment = null;
+        Set<Long> overlappingAppointments = new HashSet<>();
+        for (int i = 0; numberOfAllowedOverlap > 0 && i < appointments.size(); i++) {
+            Appointment appointment = appointments.get(i);
+            if (appointment != null && appointment.getStartDateTime() != null) {
+                LocalDateTime appointmentStart = appointment.getStartDateTime();
+                if (previousAppointment != null) {
+                    LocalDateTime previousEnd = previousAppointment.getStartDateTime().plusMinutes(previousAppointment.getDurationMinutes());
+                    if (isOverlappingAppointment(previousEnd, appointmentStart)) {
+                        overlappingAppointments.add(previousAppointment.getAppointmentId());
+                        overlappingAppointments.add(appointment.getAppointmentId());
+                        if (overlappingAppointments.size() == numberOfAllowedOverlap) {
+                            numberOfAllowedOverlap = 0;
+                        }
+                    }
+                }
+                previousAppointment = appointment;
+            }
+        }
+        return overlappingAppointments;
     }
 
     private void validateStartDateTime(LocalDateTime startDateTime) {
@@ -212,7 +331,7 @@ public class AppointmentService {
         LocalDateTime today = LocalDateTime.now();
         if (startDateTime.isBefore(today)) {
             throw new RuntimeException("startDateTime is invalid. startDateTime is before today date : "
-                    + today.format(DateTimeFormatter.ISO_LOCAL_DATE));
+                    + today.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
         }
         if (startDateTime.getDayOfWeek().getValue() == DayOfWeek.THURSDAY.getValue()
                 || startDateTime.getDayOfWeek().getValue() == DayOfWeek.FRIDAY.getValue()) {
@@ -220,233 +339,140 @@ public class AppointmentService {
         }
     }
 
-    private void checkDoctorPresenceInClinic(LocalDateTime startDateTime, Doctor doctor) {
-        List<Schedule> schedules = checkDoctorSchedule(doctor, startDateTime);
-        Schedule schedule = schedules.get(0);
-        LocalDate appointmentDate = startDateTime.toLocalDate();
-        List<ScheduleDetail> availableSchedulesByDate = schedule.getScheduleDetails().stream()
-                .filter(scheduleDetail ->
-                        scheduleDetail.getScheduleDateTimeStart().toLocalDate().compareTo(appointmentDate) == 0)
-                .sorted(Comparator.comparing(ScheduleDetail::getScheduleDateTimeStart))
-                .collect(Collectors.toList());
-        if (availableSchedulesByDate == null || availableSchedulesByDate.isEmpty()) {
-            throw new RuntimeException(
-                    "Doctor is not present on date provided in startDateTime : "
-                            + startDateTime.format(DateTimeFormatter.ISO_LOCAL_DATE));
-        }
-        LocalTime appointmentTime = startDateTime.toLocalTime();
-        List<ScheduleDetail> availableSchedulesByTime = availableSchedulesByDate.stream().filter(scheduleDetail -> {
-            LocalTime startTime = scheduleDetail.getScheduleDateTimeStart().toLocalTime();
-            LocalTime endTime = scheduleDetail.getScheduleDateTimeEnd().toLocalTime();
-            return (startTime.isBefore(appointmentTime) && endTime.isAfter(appointmentTime)) || startTime.equals(appointmentTime);
-        }).collect(Collectors.toList());
-        if (availableSchedulesByTime == null || availableSchedulesByTime.isEmpty()) {
-            throw new RuntimeException(
-                    "Doctor is not present on time provided in startDateTime : "
-                            + startDateTime.format(DateTimeFormatter.ISO_LOCAL_TIME));
-        }
-    }
-
-    private List<Appointment> checkPatientAppointmentsCount(LocalDate appointmentDate, Patient patient) {
-        List<Appointment> patientAppointments = patient.getPatientAppointments().stream()
-                .filter(appointment -> appointment.getStartDateTime().toLocalDate().isEqual(appointmentDate))
-                .collect(Collectors.toList());
+    private List<Appointment> checkPatientAppointmentsCount(LocalDateTime appointmentDate, Patient patient) {
+        List<Appointment> patientAppointments = appointmentRepository.findAppointmentsByPatientAndStartDateTimeEquals(
+                patient.getPatientId(),
+                appointmentDate.format(DateTimeFormatter.ISO_DATE));
         if (patientAppointments != null
                 && !patientAppointments.isEmpty()
-                && patientAppointments.size() == Consts.MAXIMUM_NUMBER_OF_PATIENT_APPOINTMENTS_IN_A_DAY) {
+                && patientAppointments.size() == Constants.MAXIMUM_NUMBER_OF_PATIENT_APPOINTMENTS_IN_A_DAY) {
             throw new RuntimeException("Patient already reserved "
-                    + Consts.MAXIMUM_NUMBER_OF_PATIENT_APPOINTMENTS_IN_A_DAY +
+                    + Constants.MAXIMUM_NUMBER_OF_PATIENT_APPOINTMENTS_IN_A_DAY +
                     " appointments in provided startDateTime : "
                     + appointmentDate.format(DateTimeFormatter.ISO_LOCAL_DATE));
         }
         return patientAppointments;
     }
 
-    private void checkPatientAppointmentsOverlap(LocalTime appointmentTime, List<Appointment> patientAppointments, Long patientId) {
+    private void checkPatientAppointmentsOverlap(LocalDateTime appointmentTime,
+                                                 Integer duration,
+                                                 List<Appointment> patientAppointments,
+                                                 Long patientId) {
         List<Appointment> patientOverlapAppointments = patientAppointments.stream()
-                .filter(appointment -> {
-                    LocalTime patientAppointmentTime = appointment.getStartDateTime().toLocalTime();
-                    LocalTime patientAppointmentTimePlusDuration = patientAppointmentTime.plusMinutes(appointment.getDurationMinutes());
-                    return patientAppointmentTimePlusDuration.equals(appointmentTime)
-                            || patientAppointmentTimePlusDuration.isAfter(appointmentTime);
-                }).collect(Collectors.toList());
+                .filter(appointment ->
+                        isOverlappingWithStartDateTime(appointmentTime, duration, appointment.getStartDateTime(), appointment.getDurationMinutes())
+                ).collect(Collectors.toList());
         if (patientOverlapAppointments != null && !patientOverlapAppointments.isEmpty()) {
             throw new RuntimeException(
                     "Provided patientId : " + patientId + " has already booked appointments" +
-                            " which are overlapping with time provided in startDateTime : "
-                            + appointmentTime.format(DateTimeFormatter.ISO_LOCAL_TIME));
+                            " which are overlapping with startDateTime : "
+                            + appointmentTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
         }
     }
 
-    private LocalDateTime checkDoctorAppointmentsOverlap(Doctor doctor,
-                                                         LocalDateTime startDateTime,
-                                                         Integer durationMinutes) {
-        LocalDateTime correctedStartDateTime = startDateTime;
-        LocalDate appointmentDate = startDateTime.toLocalDate();
-        List<Appointment> doctorAppointments = getDoctorAppointmentsOnAppointmentDate(doctor, appointmentDate);
-        if (doctorAppointments != null && !doctorAppointments.isEmpty()) {
-            ScheduleDetail appointmentScheduleDetail = getScheduleDetail(doctor, startDateTime);
-            LocalDateTime scheduleDateTimeStart = appointmentScheduleDetail.getScheduleDateTimeStart();
-            LocalDateTime scheduleDateTimeEnd = appointmentScheduleDetail.getScheduleDateTimeEnd();
-            long minutes = ChronoUnit.MINUTES.between(scheduleDateTimeStart, scheduleDateTimeEnd);
-            AtomicInteger totalAvailableTime = new AtomicInteger((int) minutes);
-            AtomicInteger totalAppointmentsDuration = new AtomicInteger(0);
-            List<Appointment> appointmentsInScheduleDetailRange =
-                    getAppointmentsInScheduleDetailRange(
-                            doctorAppointments,
-                            scheduleDateTimeStart,
-                            scheduleDateTimeEnd,
-                            totalAvailableTime,
-                            totalAppointmentsDuration);
+    private void checkDoctorAppointmentsOverlap(Doctor doctor,
+                                                LocalDateTime startDateTime,
+                                                Integer durationMinutes,
+                                                ScheduleDetail scheduleDetail) {
+        List<Appointment> appointments = appointmentRepository.findAppointmentsByScheduleDetail(scheduleDetail);
+        if (appointments != null && !appointments.isEmpty()) {
+            List<Appointment> overlappingWithStartDateTime =
+                    appointments.stream().filter(appointment ->
+                                    isOverlappingWithStartDateTime(
+                                            startDateTime,
+                                            durationMinutes,
+                                            appointment.getStartDateTime(),
+                                            appointment.getDurationMinutes()))
+                            .collect(Collectors.toList());
 
-            boolean isOverlappingWithStartDateTime =
-                    appointmentsInScheduleDetailRange.stream().anyMatch(appointment ->
-                            isOverlappingWithStartDateTime(startDateTime, appointment.getStartDateTime(), appointment.getDurationMinutes()));
-
-            if (totalAvailableTime.intValue() < durationMinutes || isOverlappingWithStartDateTime) {
-                correctedStartDateTime = getStartDateTimeAsOverlappingAppointment(
-                        doctor,
-                        startDateTime,
-                        durationMinutes,
-                        totalAvailableTime.intValue(),
-                        appointmentsInScheduleDetailRange);
-            }
-        }
-        return correctedStartDateTime;
-    }
-
-    private ScheduleDetail getScheduleDetail(Doctor doctor, LocalDateTime startDateTime) {
-        List<Schedule> doctorSchedules = checkDoctorSchedule(doctor, startDateTime);
-        Schedule doctorSchedule = doctorSchedules.get(0);
-        List<ScheduleDetail> scheduleDetails = doctorSchedule.getScheduleDetails();
-        if (scheduleDetails == null || scheduleDetails.isEmpty()) {
-            throw new RuntimeException("No schedule Detail found for doctorId: " + doctor.getDoctorId()
-                    + " in startDateTime: " + startDateTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
-        }
-        List<ScheduleDetail> appointmentScheduleDetailList = getScheduleDetailByStartDateTime(startDateTime, scheduleDetails);
-        if (appointmentScheduleDetailList == null || appointmentScheduleDetailList.isEmpty()) {
-            throw new RuntimeException("No schedule detail found for startDateTime:"
-                    + startDateTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
-        }
-        if (appointmentScheduleDetailList.size() > 1) {
-            throw new RuntimeException("Multiple schedule details found for startDateTime:"
-                    + startDateTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
-        }
-        return appointmentScheduleDetailList.get(0);
-    }
-
-    private static LocalDateTime getStartDateTimeAsOverlappingAppointment(
-            Doctor doctor,
-            LocalDateTime startDateTime,
-            Integer durationMinutes,
-            Integer totalAvailableTime,
-            List<Appointment> appointmentsInScheduleRange) {
-        LocalDateTime correctedStartDateTime = startDateTime;
-        int overlapCounter = 0;
-        LocalDateTime previousAppointmentEnd = null;
-        /**
-         * How come doctor.getDoctorType().getDoctorTypeOverlappingAppointments() - 1 ?
-         * 1 overlap includes 2 appointments
-         */
-        Integer doctorTypeOverlappingAppointments = doctor.getDoctorType().getDoctorTypeOverlappingAppointments();
-        boolean isOverlapAllowed = doctorTypeOverlappingAppointments > 0;
-        int numberOfAllowedOverlap = doctorTypeOverlappingAppointments > 0 ? doctorTypeOverlappingAppointments - 1 : 0;
-        for (int i = 0; i < appointmentsInScheduleRange.size() && isOverlapAllowed; i++) {
-            Appointment appointment = appointmentsInScheduleRange.get(i);
-            LocalDateTime appointmentStartDateTime = appointment.getStartDateTime();
-            if (isOverlappingAppointment(previousAppointmentEnd, appointmentStartDateTime)) {
-                overlapCounter++;
-                if (overlapCounter >= numberOfAllowedOverlap) {
-                    isOverlapAllowed = false;
+            if (!overlappingWithStartDateTime.isEmpty()) {
+                Integer doctorTypeOverlappingAppointments = doctor.getDoctorType().getDoctorTypeOverlappingAppointments();
+                int numberOfAllowedOverlap = doctorTypeOverlappingAppointments > 0 ? doctorTypeOverlappingAppointments : 0;
+                Set<Long> overlappingAppointments =
+                        checkOverlappingAppointments(
+                                appointments,
+                                numberOfAllowedOverlap);
+                boolean isNotOverlapAllowed = overlappingAppointments.size() == numberOfAllowedOverlap;
+                if (isNotOverlapAllowed) {
+                    String errorMessage = "No more overlapping is allowed! " +
+                            "Appointment overlaps with other booked appointments. doctorId: %d"
+                            + Constants.COMMA_SPACE +
+                            "startDateTime Start: %s" +
+                            Constants.COMMA_SPACE +
+                            "startDateTime End: %s" +
+                            " Overlapping with previously booked appointments.";
+                    throw new RuntimeException(
+                            String.format(errorMessage,
+                                    doctor.getDoctorId(),
+                                    startDateTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME),
+                                    startDateTime.plusMinutes(durationMinutes).format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)));
                 }
             }
-            LocalDateTime appointmentEnd = appointmentStartDateTime.plusMinutes(appointment.getDurationMinutes());
-            previousAppointmentEnd = appointmentEnd;
         }
-        if (!isOverlapAllowed) {
-            throw new RuntimeException("Appointment overlaps with registered appointments in startDateTime: "
-                    + startDateTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
+    }
+
+    private ScheduleDetail getScheduleDetailByDoctor(Doctor doctor, LocalDateTime startDateTime) {
+        Schedule doctorSchedule = checkDoctorSchedule(doctor, startDateTime);
+        ScheduleDetail scheduleDetail = getScheduleDetailBySchedule(doctorSchedule, startDateTime);
+        return scheduleDetail;
+    }
+
+    private ScheduleDetail getScheduleDetailBySchedule(Schedule schedule, LocalDateTime startDateTime) {
+        List<ScheduleDetail> scheduleDetails =
+                scheduleDetailRepository.
+                        findScheduleDetailByScheduleAndScheduleDateTimeStartLessThanEqualAndAndScheduleDateTimeEndGreaterThanEqual(
+                                schedule,
+                                startDateTime,
+                                startDateTime);
+        if (scheduleDetails == null || scheduleDetails.isEmpty()) {
+            throw new RuntimeException(String.format("No scheduleDetail found by startDateTime: %s ." +
+                            "Doctor is not available on provided startDateTime.",
+                    startDateTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)));
         }
-        if (totalAvailableTime < durationMinutes) {
-            int remainderMinutes = durationMinutes - totalAvailableTime;
-            correctedStartDateTime = startDateTime.minusMinutes(remainderMinutes);
+        if (scheduleDetails.size() > 1) {
+            throw new RuntimeException(String.format("Duplicate scheduleDetail found by startDateTime: %s",
+                    startDateTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)));
         }
-        return correctedStartDateTime;
+        ScheduleDetail scheduleDetail = scheduleDetails.get(0);
+        return scheduleDetail;
     }
 
-    private static List<ScheduleDetail> getScheduleDetailByStartDateTime(LocalDateTime startDateTime, List<ScheduleDetail> scheduleDetails) {
-        return scheduleDetails.stream().filter(scheduleDetail -> {
-            LocalDateTime scheduleDateTimeStart = scheduleDetail.getScheduleDateTimeStart();
-            return scheduleDateTimeStart.isBefore(startDateTime)
-                    || scheduleDateTimeStart.isEqual(startDateTime);
-        }).filter(scheduleDetail -> {
-            LocalDateTime scheduleDateTimeEnd = scheduleDetail.getScheduleDateTimeEnd();
-            return scheduleDateTimeEnd.isAfter(startDateTime)
-                    || scheduleDateTimeEnd.isEqual(startDateTime);
-        }).collect(Collectors.toList());
-    }
-
-    private static List<Appointment> getDoctorAppointmentsOnAppointmentDate(Doctor doctor, LocalDate appointmentDate) {
-        return doctor.getDoctorAppointments().stream()
-                .filter(doctorAppointment -> doctorAppointment.getStartDateTime().toLocalDate().isEqual(appointmentDate))
-                .sorted(Comparator.comparing(Appointment::getStartDateTime))
-                .collect(Collectors.toList());
-    }
-
-    private static List<Appointment> getAppointmentsInScheduleDetailRange(
-            List<Appointment> doctorAppointments,
-            LocalDateTime scheduleDateTimeStart,
-            LocalDateTime scheduleDateTimeEnd,
-            AtomicInteger totalAvailableTime,
-            AtomicInteger totalAppointmentsDuration) {
-        return doctorAppointments.stream().filter(appointment ->
-                        appointment.getStartDateTime().isAfter(scheduleDateTimeStart)
-                                || appointment.getStartDateTime().isEqual(scheduleDateTimeStart))
-                .filter(appointment ->
-                        appointment.getStartDateTime().isBefore(scheduleDateTimeEnd)
-                                || appointment.getStartDateTime().isEqual(scheduleDateTimeEnd))
-                .peek(appointment -> {
-                    Integer appointmentDuration = appointment.getDurationMinutes();
-                    totalAppointmentsDuration.getAndAdd(appointmentDuration);
-                    /**
-                     * appointmentDuration + 1 avoids overlapping appointments
-                     * example:
-                     * appointmentStart: 09:00, duration: 15 min, appointmentEnd: 09:15
-                     * totalAvailableTime in doctor schedule: 30 min
-                     * totalAvailableTime = 30 min - 15 min = 15 min
-                     * Which means next appointment with duration = 15 min,
-                     * will start at 09:15 causing overlap with previous appointmentEnd
-                     */
-                    int updatedAvailableTime = totalAvailableTime.intValue() - (appointmentDuration + 1);
-                    totalAvailableTime.getAndSet(updatedAvailableTime);
-                })
-                .sorted(Comparator.comparing(Appointment::getStartDateTime))
-                .collect(Collectors.toList());
-    }
-
-    private static boolean isOverlappingWithStartDateTime(LocalDateTime startDateTime, LocalDateTime appointmentStartDateTime, Integer appointmentDuration) {
-        return (startDateTime.isAfter(appointmentStartDateTime)
-                || startDateTime.isEqual(appointmentStartDateTime))
-                && (startDateTime.isBefore(appointmentStartDateTime.plusMinutes(appointmentDuration))
-                || startDateTime.isEqual(appointmentStartDateTime.plusMinutes(appointmentDuration)));
+    private static boolean isOverlappingWithStartDateTime(LocalDateTime startDateTime,
+                                                          Integer durationMinutes,
+                                                          LocalDateTime appointmentStartDateTime,
+                                                          Integer appointmentDuration) {
+        LocalDateTime appointmentEndDateTime = appointmentStartDateTime.plusMinutes(appointmentDuration);
+        LocalDateTime endDateTime = startDateTime.plusMinutes(durationMinutes);
+        return ((startDateTime.isAfter(appointmentStartDateTime) || startDateTime.isEqual(appointmentStartDateTime))
+                && (startDateTime.isBefore(appointmentEndDateTime) || startDateTime.isEqual(appointmentEndDateTime)))
+                ||
+                ((endDateTime.isAfter(appointmentStartDateTime) || endDateTime.isEqual(appointmentStartDateTime))
+                        && (endDateTime.isBefore(appointmentEndDateTime) || endDateTime.isEqual(appointmentEndDateTime)))
+                ;
     }
 
     private static boolean isOverlappingAppointment(LocalDateTime previousAppointmentEnd, LocalDateTime appointmentStartDateTime) {
-        return previousAppointmentEnd != null
-                && (previousAppointmentEnd.isAfter(appointmentStartDateTime)
-                || previousAppointmentEnd.isEqual(appointmentStartDateTime));
+        return previousAppointmentEnd.isAfter(appointmentStartDateTime)
+                || previousAppointmentEnd.isEqual(appointmentStartDateTime);
     }
 
-    private List<Schedule> checkDoctorSchedule(Doctor doctor, LocalDateTime startDateTime) {
+    private Schedule checkDoctorSchedule(Doctor doctor, LocalDateTime startDateTime) {
         List<Schedule> doctorSchedules = scheduleRepository.
                 findSchedulesByDoctorAndScheduleEndDateGreaterThanEqualAndScheduleStartDateLessThanEqual(doctor, startDateTime, startDateTime);
         if (doctorSchedules == null || doctorSchedules.isEmpty()) {
-            throw new RuntimeException("No schedule found by doctorId and startDateTime.");
+            throw new RuntimeException(
+                    String.format("No schedule found by doctorId: %d and startDateTime: %s",
+                            doctor.getDoctorId(),
+                            startDateTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+                    ));
         }
         if (doctorSchedules.size() > 1) {
-            throw new RuntimeException("More than one schedule is found by doctor and startDateTime.");
+            throw new RuntimeException(
+                    String.format("More than one schedule is found by doctorId: %d and startDateTime: %s",
+                            doctor.getDoctorId(),
+                            startDateTime.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)));
         }
-        return doctorSchedules;
+        return doctorSchedules.get(0);
     }
 
     private void validateDurationInMinutes(Integer durationMinutes, Doctor doctor) {

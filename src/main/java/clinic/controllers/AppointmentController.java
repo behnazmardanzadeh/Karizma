@@ -25,6 +25,7 @@ public class AppointmentController {
             Appointment savedAppointment = appointmentService.saveAppointment(setAppointmentDto);
             return new ResponseEntity<>(savedAppointment, HttpStatus.CREATED);
         } catch (Exception e) {
+            e.printStackTrace();
             log.error(e.getMessage());
             if (e instanceof  IllegalArgumentException) {
                 throw new ResponseStatusException(HttpStatus.NOT_FOUND, e.getMessage(), e);

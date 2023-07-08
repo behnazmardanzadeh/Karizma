@@ -7,7 +7,7 @@ import javax.persistence.*;
 @Entity
 @Table(name = "DOCTOR_TYPE")
 @Data
-public class DoctorType {
+public class DoctorType implements IEntity{
     @Id
     @Column(name = "DOCTOR_TYPE_ID")
     @GeneratedValue(strategy= GenerationType.AUTO)

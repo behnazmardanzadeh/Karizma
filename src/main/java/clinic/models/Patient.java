@@ -1,17 +1,17 @@
 package clinic.models;
 
-import com.fasterxml.jackson.annotation.JsonIgnore;
-import lombok.Getter;
-import lombok.Setter;
+import lombok.*;
 
 import javax.persistence.*;
-import java.util.List;
 
 @Entity
 @Table(name = "PATIENT")
 @Getter
 @Setter
-public class Patient {
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class Patient implements IEntity{
     @Id
     @Column(name = "PATIENT_ID")
     @GeneratedValue(strategy= GenerationType.AUTO)
@@ -20,7 +20,6 @@ public class Patient {
     @Column(name = "PATIENT_NAME")
     private String patientName;
 
-    @JsonIgnore
-    @OneToMany(mappedBy = "patient")
-    private List<Appointment> patientAppointments;
+    @Column(name = "PATIENT_EMAIL")
+    private String patientEmail;
 }

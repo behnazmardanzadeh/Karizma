@@ -14,7 +14,7 @@ import java.time.LocalDateTime;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class Appointment {
+public class Appointment implements IEntity {
     @Id
     @Column(name = "APPOINTMENT_ID")
     @GeneratedValue(strategy= GenerationType.AUTO)
@@ -33,4 +33,8 @@ public class Appointment {
     @ManyToOne
     @JoinColumn(name = "PATIENT_ID", referencedColumnName = "PATIENT_ID")
     private Patient patient;
+
+    @OneToOne
+    @JoinColumn(name = "SCHEDULE_DETAIL_ID", referencedColumnName = "SCHEDULE_DETAIL_ID", nullable = false)
+    private ScheduleDetail scheduleDetail;
 }
