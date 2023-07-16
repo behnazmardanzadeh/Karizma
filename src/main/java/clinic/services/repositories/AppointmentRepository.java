@@ -8,7 +8,7 @@ import org.springframework.data.repository.query.Param;
 
 import java.util.List;
 
-public interface AppointmentRepository extends JpaRepository<Appointment, Long> {
+public interface AppointmentRepository extends JpaRepository<Appointment, Long>, EntityRepositoryCustom {
     List<Appointment> findAppointmentsByScheduleDetail(ScheduleDetail scheduleDetail);
     @Query(value = "SELECT \n" +
             "* \n" +
@@ -16,4 +16,14 @@ public interface AppointmentRepository extends JpaRepository<Appointment, Long> 
             "where patient_id = :patientId\n" +
             "and to_char(START_DATE_TIME , 'yyyy-mm-dd') = :date", nativeQuery = true)
     List<Appointment> findAppointmentsByPatientAndStartDateTimeEquals(@Param("patientId") Long patientId, @Param("date") String date);
+
+    @Query(value = "SELECT \n" +
+            "* \n" +
+            "FROM APPOINTMENT\n" +
+            "where patient_id = :patientId\n" +
+            "and to_char(START_DATE_TIME , 'yyyy-mm-dd') = :date" +
+            "and appointment_id <> :appointmentId", nativeQuery = true)
+    List<Appointment> findAppointmentsByAppointmentIdAndPatientAndStartDateTimeEquals(@Param("patientId") Long patientId,
+                                                                                      @Param("date") String date,
+                                                                                      @Param("appointmentId") Long appointmentId);
 }

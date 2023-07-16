@@ -1,33 +1,20 @@
 package clinic.config;
 
-import clinic.config.eventhandler.AbstractRepositoryEventListener;
-import clinic.config.eventhandler.AfterSaveEvent;
-import clinic.config.eventhandler.SaveAppointmentEventHandler;
-import clinic.models.Appointment;
+import clinic.config.eventhandler.CreateAppointmentEmailHandler;
+import clinic.config.eventhandler.SaveAppointmentEmailHandler;
 import clinic.services.AppointmentService;
-import clinic.services.email.SaveAppointmentEmailServiceImpl;
+import clinic.services.email.EmailServiceImpl;
 import clinic.services.repositories.*;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.context.event.EventListener;
+import org.springframework.mail.SimpleMailMessage;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.JavaMailSenderImpl;
-
-import javax.annotation.PostConstruct;
 import java.util.Properties;
 
 @Configuration
 public class ComponentsConfig {
-    private SaveAppointmentEventHandler saveAppointmentEventHandler;
-    private SaveAppointmentEmailServiceImpl saveAppointmentEmailService;
-
-//    @PostConstruct
-//    @ConditionalOnBean
-//    public void init() {
-//        saveAppointmentEventHandler = new SaveAppointmentEventHandler(saveAppointmentEmailService);
-//    }
 
     @Bean
     public AppointmentService getAppointmentService(AppointmentRepository appointmentRepository,
@@ -46,7 +33,7 @@ public class ComponentsConfig {
         mailSender.setPort(587);
 
         mailSender.setUsername("karizmarestapi@gmail.com");
-        mailSender.setPassword("A123456a!");
+        mailSender.setPassword("wbhwvvpklmtifigg");
 
         Properties props = mailSender.getJavaMailProperties();
         props.put("mail.transport.protocol", "smtp");
@@ -58,22 +45,24 @@ public class ComponentsConfig {
     }
 
     @Bean
-    public SaveAppointmentEmailServiceImpl getSaveAppointmentEmailServiceImpl(JavaMailSender emailSender){
-        SaveAppointmentEmailServiceImpl saveAppointmentEmailService = new SaveAppointmentEmailServiceImpl(emailSender);
-        this.saveAppointmentEmailService = saveAppointmentEmailService;
-        return saveAppointmentEmailService;
+    public EmailServiceImpl getEmailServiceImpl(JavaMailSender emailSender, SimpleMailMessage template){
+        return new EmailServiceImpl(emailSender, template);
     }
 
     @Bean
-    @ConditionalOnBean(value = SaveAppointmentEmailServiceImpl.class)
-    public SaveAppointmentEventHandler getSaveAppointmentEventHandler(SaveAppointmentEmailServiceImpl saveAppointmentEmailService){
-        this.saveAppointmentEventHandler = new SaveAppointmentEventHandler(saveAppointmentEmailService);
-        return saveAppointmentEventHandler;
+    @ConditionalOnBean(value = EmailServiceImpl.class)
+    public CreateAppointmentEmailHandler getCreateAppointmentEventHandler(EmailServiceImpl emailService){
+        return new CreateAppointmentEmailHandler(emailService);
     }
 
-    @ConditionalOnBean(value = SaveAppointmentEventHandler.class)
-    @EventListener
-    public void setSaveAppointmentEventHandler(AfterSaveEvent afterSaveEvent) {
-        saveAppointmentEventHandler.onApplicationEvent(afterSaveEvent);
+    @Bean
+    @ConditionalOnBean(value = EmailServiceImpl.class)
+    public SaveAppointmentEmailHandler getSaveAppointmentEventHandler(EmailServiceImpl emailService){
+        return new SaveAppointmentEmailHandler(emailService);
+    }
+
+    @Bean
+    public SimpleMailMessage templateSimpleMessage() {
+        return new SimpleMailMessage();
     }
 }

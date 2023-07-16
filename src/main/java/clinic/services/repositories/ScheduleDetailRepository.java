@@ -12,8 +12,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 
-public interface ScheduleDetailRepository extends JpaRepository<ScheduleDetail, Long> {
-    List<ScheduleDetail> findScheduleDetailByScheduleOrderByScheduleDateTimeStartAsc(Schedule schedule);
+public interface ScheduleDetailRepository extends JpaRepository<ScheduleDetail, Long>, EntityRepositoryCustom {
     List<ScheduleDetail>
     findScheduleDetailByScheduleAndScheduleDateTimeStartLessThanEqualAndAndScheduleDateTimeEndGreaterThanEqual(Schedule schedule,
                                                                                                             LocalDateTime startDateTime,

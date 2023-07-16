@@ -47,4 +47,18 @@ public class AppointmentController {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage(), e);
         }
     }
+
+    @PostMapping(path = Routes.POST_api_updateAppointment, produces = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<Appointment> updateAppointment(@RequestBody SetAppointmentDto setAppointmentDto) {
+        try {
+            Appointment savedAppointment = appointmentService.updateAppointment(setAppointmentDto);
+            return new ResponseEntity<>(savedAppointment, HttpStatus.OK);
+        } catch (Exception e) {
+            log.error(e.getMessage());
+            if (e instanceof  IllegalArgumentException) {
+                throw new ResponseStatusException(HttpStatus.NOT_FOUND, e.getMessage(), e);
+            }
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage(), e);
+        }
+    }
 }

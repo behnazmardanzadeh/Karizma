@@ -1,13 +1,15 @@
 package clinic.services;
 
 import clinic.common.Constants;
-import clinic.config.eventhandler.AfterSaveEvent;
 import clinic.models.*;
 import clinic.models.dto.ScheduleDetailAppointmentDto;
 import clinic.models.dto.SetAppointmentDto;
+import clinic.models.dto.UpdateEmailDto;
 import clinic.services.repositories.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.data.rest.core.event.AfterCreateEvent;
+import org.springframework.data.rest.core.event.AfterSaveEvent;
 
 import java.time.DayOfWeek;
 import java.time.LocalDateTime;
@@ -49,7 +51,7 @@ public class AppointmentService {
         Integer durationMinutes = setAppointmentDto.getDurationMinutes();
         validateDurationInMinutes(durationMinutes, doctor);
         LocalDateTime startDateTime = setAppointmentDto.getStartDateTime();
-        validateStartDateTime(startDateTime);
+        validateStartDateTimeForCreate(startDateTime);
         ScheduleDetail scheduleDetail = getScheduleDetailByDoctor(doctor, startDateTime);
         List<Appointment> patientAppointments = checkPatientAppointmentsCount(startDateTime, patient);
         if (patientAppointments != null && !patientAppointments.isEmpty()) {
@@ -58,15 +60,67 @@ public class AppointmentService {
         checkStartDateTimeInScheduleDetailRange(startDateTime, durationMinutes, scheduleDetail);
         checkDoctorAppointmentsOverlap(doctor, startDateTime, durationMinutes, scheduleDetail);
 
-        Appointment savedAppointment = appointmentRepository.save(
-                Appointment.builder()
-                        .doctor(doctor)
-                        .patient(patient)
-                        .durationMinutes(durationMinutes)
-                        .startDateTime(startDateTime)
-                        .scheduleDetail(scheduleDetail)
-                        .build());
-        applicationEventPublisher.publishEvent(new AfterSaveEvent(savedAppointment));
+        Appointment appointment = Appointment.builder()
+                .doctor(doctor)
+                .patient(patient)
+                .durationMinutes(durationMinutes)
+                .startDateTime(startDateTime)
+                .scheduleDetail(scheduleDetail)
+                .build();
+        Appointment savedAppointment = getSavedAppointment(appointment);
+        return savedAppointment;
+    }
+
+    public Appointment updateAppointment(SetAppointmentDto setAppointmentDto) {
+
+        if (setAppointmentDto.getAppointmentId() == null) {
+            throw new IllegalArgumentException("appointmentId is mandatory in update service.");
+        }
+
+        Doctor doctor = getAppointmentDoctor(setAppointmentDto.getDoctorId());
+        Patient patient = getAppointmentPatient(setAppointmentDto.getPatientId());
+
+        Integer durationMinutes = setAppointmentDto.getDurationMinutes();
+        validateDurationInMinutes(durationMinutes, doctor);
+        LocalDateTime startDateTime = setAppointmentDto.getStartDateTime();
+        validateStartDateTime(startDateTime);
+        ScheduleDetail scheduleDetail = getScheduleDetailByDoctor(doctor, startDateTime);
+        List<Appointment> patientAppointments = checkPatientAppointmentsCountUpdate(startDateTime, patient, setAppointmentDto.getAppointmentId());
+        if (patientAppointments != null && !patientAppointments.isEmpty()) {
+            checkPatientAppointmentsOverlap(startDateTime, durationMinutes, patientAppointments, patient.getPatientId());
+        }
+        checkStartDateTimeInScheduleDetailRange(startDateTime, durationMinutes, scheduleDetail);
+        checkDoctorAppointmentsOverlap(doctor, startDateTime, durationMinutes, scheduleDetail);
+
+        Appointment appointment = Appointment.builder()
+                .appointmentId(setAppointmentDto.getAppointmentId())
+                .doctor(doctor)
+                .patient(patient)
+                .durationMinutes(durationMinutes)
+                .startDateTime(startDateTime)
+                .scheduleDetail(scheduleDetail)
+                .build();
+        Appointment savedAppointment = getSavedAppointment(appointment);
+        return savedAppointment;
+    }
+
+    private Appointment getSavedAppointment(Appointment appointment) {
+        boolean isUpdate = appointment.getAppointmentId() != null;
+        Appointment oldAppointment = null;
+        UpdateEmailDto updateEmailDto = null;
+        if (isUpdate) {
+            oldAppointment = appointmentRepository.findById(appointment.getAppointmentId())
+                    .orElseThrow(() -> new IllegalArgumentException("appointmentId not found"));
+            appointmentRepository.detach(oldAppointment);
+            updateEmailDto = UpdateEmailDto.builder().oldAppointment(oldAppointment).build();;
+        }
+        Appointment savedAppointment = appointmentRepository.save(appointment);
+        if (isUpdate) {
+            updateEmailDto.setNewAppointment(savedAppointment);
+            applicationEventPublisher.publishEvent(new AfterSaveEvent(updateEmailDto));
+        } else {
+            applicationEventPublisher.publishEvent(new AfterCreateEvent(savedAppointment));
+        }
         return savedAppointment;
     }
 
@@ -114,15 +168,15 @@ public class AppointmentService {
             checkPatientAppointmentsOverlap(startDateTime, durationMinutes, patientAppointments, patient.getPatientId());
         }
         ScheduleDetail scheduleDetail = getScheduleDetailByDoctor(doctor, startDateTime);
-        Appointment savedAppointment = appointmentRepository.save(
-                Appointment.builder()
-                        .doctor(doctor)
-                        .patient(patient)
-                        .durationMinutes(durationMinutes)
-                        .startDateTime(startDateTime)
-                        .scheduleDetail(scheduleDetail)
-                        .build());
-        applicationEventPublisher.publishEvent(new AfterSaveEvent(savedAppointment));
+
+        Appointment appointment = Appointment.builder()
+                .doctor(doctor)
+                .patient(patient)
+                .durationMinutes(durationMinutes)
+                .startDateTime(startDateTime)
+                .scheduleDetail(scheduleDetail)
+                .build();
+        Appointment savedAppointment = getSavedAppointment(appointment);
         return savedAppointment;
     }
 
@@ -159,11 +213,11 @@ public class AppointmentService {
 
         Map<Long, List<Appointment>> scheduleDetailAppointmentsMap = new HashMap<>();
         List<ScheduleDetail> scheduleDetails = new ArrayList<>();
-        List<Appointment> allAppointments = new ArrayList<>();
+        Map<LocalDateTime, List<Long>> startAppointmentIdListMap = new HashMap<>();
+        Map<LocalDateTime, List<Long>> endAppointmentIdListMap = new HashMap<>();
         scheduleDetailAppointmentDtoList.stream().forEach(scheduleDetailAppointmentDto -> {
             ScheduleDetail scheduleDetail = scheduleDetailAppointmentDto.getScheduleDetail();
             Appointment appointment = scheduleDetailAppointmentDto.getAppointment();
-            allAppointments.add(appointment);
             scheduleDetails.add(scheduleDetail);
             Long scheduleDetailId = scheduleDetail.getScheduleDetailId();
             List<Appointment> appointments = scheduleDetailAppointmentsMap.get(scheduleDetailId);
@@ -172,29 +226,24 @@ public class AppointmentService {
             } else {
                 scheduleDetailAppointmentsMap.remove(scheduleDetailId);
             }
-            appointments.add(appointment);
-            appointments.sort(Comparator.comparing(Appointment::getStartDateTime));
+
+            if (appointment != null) {
+                Long appointmentId = appointment.getAppointmentId();
+
+                LocalDateTime startDateTime = appointment.getStartDateTime();
+                updateMap(startAppointmentIdListMap, appointmentId, startDateTime);
+
+                Integer appointmentDurationMinutes = appointment.getDurationMinutes();
+                LocalDateTime startDateTimeEnd = startDateTime.plusMinutes(appointmentDurationMinutes);
+                updateMap(endAppointmentIdListMap, appointmentId, startDateTimeEnd);
+
+                appointments.add(appointment);
+                appointments.sort(Comparator.comparing(Appointment::getStartDateTime));
+            }
+
             scheduleDetailAppointmentsMap.put(scheduleDetailId, appointments);
         });
         scheduleDetails.sort(Comparator.comparing(ScheduleDetail::getScheduleDateTimeStart));
-
-        Map<LocalDateTime, List<Long>> startAppointmentIdListMap = new HashMap<>();
-        Map<LocalDateTime, List<Long>> endAppointmentIdListMap = new HashMap<>();
-        if (!allAppointments.isEmpty()) {
-            allAppointments.stream()
-                    .filter(Objects::nonNull)
-                    .filter(appointment -> appointment.getAppointmentId() != null)
-                    .forEach(appointment -> {
-                        Long appointmentId = appointment.getAppointmentId();
-
-                        LocalDateTime startDateTime = appointment.getStartDateTime();
-                        updateMap(startAppointmentIdListMap, appointmentId, startDateTime);
-
-                        Integer appointmentDurationMinutes = appointment.getDurationMinutes();
-                        LocalDateTime startDateTimeEnd = startDateTime.plusMinutes(appointmentDurationMinutes);
-                        updateMap(endAppointmentIdListMap, appointmentId, startDateTimeEnd);
-                    });
-        }
 
         Integer doctorTypeOverlappingAppointments = doctor.getDoctorType().getDoctorTypeOverlappingAppointments();
         int numberOfAllowedOverlap = doctorTypeOverlappingAppointments > 0 ? doctorTypeOverlappingAppointments : 0;
@@ -324,10 +373,14 @@ public class AppointmentService {
         return overlappingAppointments;
     }
 
-    private void validateStartDateTime(LocalDateTime startDateTime) {
+    private void validateStartDateTimeForCreate(LocalDateTime startDateTime) {
         if (startDateTime == null) {
             throw new IllegalArgumentException("startDateTime is null.");
         }
+        validateStartDateTime(startDateTime);
+    }
+
+    private static void validateStartDateTime(LocalDateTime startDateTime) {
         LocalDateTime today = LocalDateTime.now();
         if (startDateTime.isBefore(today)) {
             throw new RuntimeException("startDateTime is invalid. startDateTime is before today date : "
@@ -343,6 +396,22 @@ public class AppointmentService {
         List<Appointment> patientAppointments = appointmentRepository.findAppointmentsByPatientAndStartDateTimeEquals(
                 patient.getPatientId(),
                 appointmentDate.format(DateTimeFormatter.ISO_DATE));
+        if (patientAppointments != null
+                && !patientAppointments.isEmpty()
+                && patientAppointments.size() == Constants.MAXIMUM_NUMBER_OF_PATIENT_APPOINTMENTS_IN_A_DAY) {
+            throw new RuntimeException("Patient already reserved "
+                    + Constants.MAXIMUM_NUMBER_OF_PATIENT_APPOINTMENTS_IN_A_DAY +
+                    " appointments in provided startDateTime : "
+                    + appointmentDate.format(DateTimeFormatter.ISO_LOCAL_DATE));
+        }
+        return patientAppointments;
+    }
+
+    private List<Appointment> checkPatientAppointmentsCountUpdate(LocalDateTime appointmentDate, Patient patient, Long appointmentId) {
+        List<Appointment> patientAppointments = appointmentRepository.findAppointmentsByAppointmentIdAndPatientAndStartDateTimeEquals(
+                patient.getPatientId(),
+                appointmentDate.format(DateTimeFormatter.ISO_DATE),
+                appointmentId);
         if (patientAppointments != null
                 && !patientAppointments.isEmpty()
                 && patientAppointments.size() == Constants.MAXIMUM_NUMBER_OF_PATIENT_APPOINTMENTS_IN_A_DAY) {
